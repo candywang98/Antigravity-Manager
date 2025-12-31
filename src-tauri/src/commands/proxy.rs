@@ -3,6 +3,9 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use serde::{Serialize, Deserialize};
 use crate::proxy::{ProxyConfig, TokenManager};
+use tokio::time::Duration;
+use crate::proxy::monitor::{ProxyMonitor, ProxyRequestLog, ProxyStats};
+
 
 /// 反代服务状态
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -13,17 +16,10 @@ pub struct ProxyStatus {
     pub active_accounts: usize,
 }
 
-/// 反代服务统计
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ProxyStats {
-    pub total_requests: u64,
-    pub success_count: u64,
-    pub error_count: u64,
-}
-
 /// 反代服务全局状态
 pub struct ProxyServiceState {
     pub instance: Arc<RwLock<Option<ProxyServiceInstance>>>,
+    pub monitor: Arc<RwLock<Option<Arc<ProxyMonitor>>>>,
 }
 
 /// 反代服务实例
@@ -38,6 +34,7 @@ impl ProxyServiceState {
     pub fn new() -> Self {
         Self {
             instance: Arc::new(RwLock::new(None)),
+            monitor: Arc::new(RwLock::new(None)),
         }
     }
 }
@@ -47,7 +44,7 @@ impl ProxyServiceState {
 pub async fn start_proxy_service(
     config: ProxyConfig,
     state: State<'_, ProxyServiceState>,
-    _app_handle: tauri::AppHandle,
+    app_handle: tauri::AppHandle,
 ) -> Result<ProxyStatus, String> {
     let mut instance_lock = state.instance.write().await;
     
@@ -55,9 +52,25 @@ pub async fn start_proxy_service(
     if instance_lock.is_some() {
         return Err("服务已在运行中".to_string());
     }
+
+    // Ensure monitor exists
+    {
+        let mut monitor_lock = state.monitor.write().await;
+        if monitor_lock.is_none() {
+            *monitor_lock = Some(Arc::new(ProxyMonitor::new(1000, Some(app_handle.clone()))));
+        }
+        // Sync enabled state from config
+        if let Some(monitor) = monitor_lock.as_ref() {
+            monitor.set_enabled(config.enable_logging);
+        }
+    }
+    
+    let monitor = state.monitor.read().await.as_ref().unwrap().clone();
     
     // 2. 初始化 Token 管理器
     let app_data_dir = crate::modules::account::get_data_dir()?;
+    // Ensure accounts dir exists even if the user will only use non-Google providers (e.g. z.ai).
+    let _ = crate::modules::account::get_accounts_dir()?;
     let accounts_dir = app_data_dir.clone();
     
     let token_manager = Arc::new(TokenManager::new(accounts_dir));
@@ -67,17 +80,28 @@ pub async fn start_proxy_service(
         .map_err(|e| format!("加载账号失败: {}", e))?;
     
     if active_accounts == 0 {
-        return Err("没有可用账号，请先添加账号".to_string());
+        let zai_enabled = config.zai.enabled
+            && !matches!(config.zai.dispatch_mode, crate::proxy::ZaiDispatchMode::Off);
+        if !zai_enabled {
+            return Err("没有可用账号，请先添加账号".to_string());
+        }
     }
     
     // 启动 Axum 服务器
-    let (axum_server, server_handle) = 
+    let (axum_server, server_handle) =
         match crate::proxy::AxumServer::start(
+            config.get_bind_address().to_string(),
             config.port,
             token_manager.clone(),
             config.anthropic_mapping.clone(),
+            config.openai_mapping.clone(),
+            config.custom_mapping.clone(),
             config.request_timeout,
             config.upstream_proxy.clone(),
+            crate::proxy::ProxySecurityConfig::from_proxy_config(&config),
+            config.zai.clone(),
+            monitor.clone(),
+
         ).await {
             Ok((server, handle)) => (server, handle),
             Err(e) => return Err(format!("启动 Axum 服务器失败: {}", e)),
@@ -102,7 +126,7 @@ pub async fn start_proxy_service(
     Ok(ProxyStatus {
         running: true,
         port: config.port,
-        base_url: format!("http://localhost:{}", config.port),
+        base_url: format!("http://127.0.0.1:{}", config.port),
         active_accounts,
     })
 }
@@ -139,7 +163,7 @@ pub async fn get_proxy_status(
         Some(instance) => Ok(ProxyStatus {
             running: true,
             port: instance.config.port,
-            base_url: format!("http://localhost:{}", instance.config.port),
+            base_url: format!("http://127.0.0.1:{}", instance.config.port),
             active_accounts: instance.token_manager.len(),
         }),
         None => Ok(ProxyStatus {
@@ -154,10 +178,53 @@ pub async fn get_proxy_status(
 /// 获取反代服务统计
 #[tauri::command]
 pub async fn get_proxy_stats(
-    _state: State<'_, ProxyServiceState>,
+    state: State<'_, ProxyServiceState>,
 ) -> Result<ProxyStats, String> {
-    // TODO: 实现统计收集
-    Ok(ProxyStats::default())
+    let monitor_lock = state.monitor.read().await;
+    if let Some(monitor) = monitor_lock.as_ref() {
+        Ok(monitor.get_stats().await)
+    } else {
+        Ok(ProxyStats::default())
+    }
+}
+
+/// 获取反代请求日志
+#[tauri::command]
+pub async fn get_proxy_logs(
+    state: State<'_, ProxyServiceState>,
+    limit: Option<usize>,
+) -> Result<Vec<ProxyRequestLog>, String> {
+    let monitor_lock = state.monitor.read().await;
+    if let Some(monitor) = monitor_lock.as_ref() {
+        Ok(monitor.get_logs(limit.unwrap_or(100)).await)
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+/// 设置监控开启状态
+#[tauri::command]
+pub async fn set_proxy_monitor_enabled(
+    state: State<'_, ProxyServiceState>,
+    enabled: bool,
+) -> Result<(), String> {
+    let monitor_lock = state.monitor.read().await;
+    if let Some(monitor) = monitor_lock.as_ref() {
+        monitor.set_enabled(enabled);
+    }
+    Ok(())
+}
+
+/// 清除反代请求日志
+#[tauri::command]
+pub async fn clear_proxy_logs(
+    state: State<'_, ProxyServiceState>,
+) -> Result<(), String> {
+    let monitor_lock = state.monitor.read().await;
+    if let Some(monitor) = monitor_lock.as_ref() {
+        monitor.clear().await;
+    }
+    Ok(())
 }
 
 /// 生成 API Key
@@ -186,21 +253,136 @@ pub async fn reload_proxy_accounts(
 /// 更新模型映射表 (热更新)
 #[tauri::command]
 pub async fn update_model_mapping(
-    mapping: std::collections::HashMap<String, String>,
+    config: ProxyConfig,
     state: State<'_, ProxyServiceState>,
 ) -> Result<(), String> {
     let instance_lock = state.instance.read().await;
     
-    // 1. 如果服务正在运行，立即更新内存中的映射
+    // 1. 如果服务正在运行，立即更新内存中的映射 (这里目前只更新了 anthropic_mapping 的 RwLock, 
+    // 后续可以根据需要让 resolve_model_route 直接读取全量 config)
     if let Some(instance) = instance_lock.as_ref() {
-        instance.axum_server.update_mapping(mapping.clone()).await;
-        tracing::info!("后端服务已接收新的模型映射配置");
+        instance.axum_server.update_mapping(&config).await;
+        tracing::info!("后端服务已接收全量模型映射配置");
     }
     
     // 2. 无论是否运行，都保存到全局配置持久化
     let mut app_config = crate::modules::config::load_app_config().map_err(|e| e)?;
-    app_config.proxy.anthropic_mapping = mapping;
+    app_config.proxy.anthropic_mapping = config.anthropic_mapping;
+    app_config.proxy.openai_mapping = config.openai_mapping;
+    app_config.proxy.custom_mapping = config.custom_mapping;
     crate::modules::config::save_app_config(&app_config).map_err(|e| e)?;
     
     Ok(())
 }
+
+fn join_base_url(base: &str, path: &str) -> String {
+    let base = base.trim_end_matches('/');
+    let path = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{}", path)
+    };
+    format!("{}{}", base, path)
+}
+
+fn extract_model_ids(value: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+
+    fn push_from_item(out: &mut Vec<String>, item: &serde_json::Value) {
+        match item {
+            serde_json::Value::String(s) => out.push(s.to_string()),
+            serde_json::Value::Object(map) => {
+                if let Some(id) = map.get("id").and_then(|v| v.as_str()) {
+                    out.push(id.to_string());
+                } else if let Some(name) = map.get("name").and_then(|v| v.as_str()) {
+                    out.push(name.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    match value {
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                push_from_item(&mut out, item);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            if let Some(data) = map.get("data") {
+                if let serde_json::Value::Array(arr) = data {
+                    for item in arr {
+                        push_from_item(&mut out, item);
+                    }
+                }
+            }
+            if let Some(models) = map.get("models") {
+                match models {
+                    serde_json::Value::Array(arr) => {
+                        for item in arr {
+                            push_from_item(&mut out, item);
+                        }
+                    }
+                    other => push_from_item(&mut out, other),
+                }
+            }
+        }
+        _ => {}
+    }
+
+    out
+}
+
+/// Fetch available models from the configured z.ai Anthropic-compatible API (`/v1/models`).
+#[tauri::command]
+pub async fn fetch_zai_models(
+    zai: crate::proxy::ZaiConfig,
+    upstream_proxy: crate::proxy::config::UpstreamProxyConfig,
+    request_timeout: u64,
+) -> Result<Vec<String>, String> {
+    if zai.base_url.trim().is_empty() {
+        return Err("z.ai base_url is empty".to_string());
+    }
+    if zai.api_key.trim().is_empty() {
+        return Err("z.ai api_key is not set".to_string());
+    }
+
+    let url = join_base_url(&zai.base_url, "/v1/models");
+
+    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(request_timeout.max(5)));
+    if upstream_proxy.enabled && !upstream_proxy.url.is_empty() {
+        let proxy = reqwest::Proxy::all(&upstream_proxy.url)
+            .map_err(|e| format!("Invalid upstream proxy url: {}", e))?;
+        builder = builder.proxy(proxy);
+    }
+    let client = builder
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+
+    let resp = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", zai.api_key))
+        .header("x-api-key", zai.api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("accept", "application/json")
+        .send()
+        .await
+        .map_err(|e| format!("Upstream request failed: {}", e))?;
+
+    let status = resp.status();
+    let text = resp.text().await.map_err(|e| format!("Failed to read response: {}", e))?;
+
+    if !status.is_success() {
+        let preview = if text.len() > 4000 { &text[..4000] } else { &text };
+        return Err(format!("Upstream returned {}: {}", status, preview));
+    }
+
+    let json: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("Invalid JSON response: {}", e))?;
+    let mut models = extract_model_ids(&json);
+    models.retain(|s| !s.trim().is_empty());
+    models.sort();
+    models.dedup();
+    Ok(models)
+}
+

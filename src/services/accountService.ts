@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core';
+import { request as invoke } from '../utils/request';
 import { Account, QuotaData } from '../types/account';
 
 // 检查 Tauri 环境
@@ -24,6 +24,10 @@ export async function addAccount(email: string, refreshToken: string): Promise<A
 
 export async function deleteAccount(accountId: string): Promise<void> {
     return await invoke('delete_account', { accountId });
+}
+
+export async function deleteAccounts(accountIds: string[]): Promise<void> {
+    return await invoke('delete_accounts', { accountIds });
 }
 
 export async function switchAccount(accountId: string): Promise<void> {
@@ -65,6 +69,21 @@ export async function startOAuthLogin(): Promise<Account> {
     }
 }
 
+export async function completeOAuthLogin(): Promise<Account> {
+    ensureTauriEnvironment();
+    try {
+        return await invoke('complete_oauth_login');
+    } catch (error) {
+        if (typeof error === 'string') {
+            if (error.includes('Refresh Token') || error.includes('refresh_token')) {
+                throw error;
+            }
+            throw `OAuth 授权失败: ${error}`;
+        }
+        throw error;
+    }
+}
+
 export async function cancelOAuthLogin(): Promise<void> {
     ensureTauriEnvironment();
     return await invoke('cancel_oauth_login');
@@ -77,4 +96,12 @@ export async function importV1Accounts(): Promise<Account[]> {
 
 export async function importFromDb(): Promise<Account> {
     return await invoke('import_from_db');
+}
+
+export async function importFromCustomDb(path: string): Promise<Account> {
+    return await invoke('import_custom_db', { path });
+}
+
+export async function syncAccountFromDb(): Promise<Account | null> {
+    return await invoke('sync_account_from_db');
 }

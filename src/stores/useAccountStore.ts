@@ -13,15 +13,19 @@ interface AccountState {
     fetchCurrentAccount: () => Promise<void>;
     addAccount: (email: string, refreshToken: string) => Promise<void>;
     deleteAccount: (accountId: string) => Promise<void>;
+    deleteAccounts: (accountIds: string[]) => Promise<void>;
     switchAccount: (accountId: string) => Promise<void>;
     refreshQuota: (accountId: string) => Promise<void>;
     refreshAllQuotas: () => Promise<accountService.RefreshStats>;
 
     // 新增 actions
     startOAuthLogin: () => Promise<void>;
+    completeOAuthLogin: () => Promise<void>;
     cancelOAuthLogin: () => Promise<void>;
     importV1Accounts: () => Promise<void>;
     importFromDb: () => Promise<void>;
+    importFromCustomDb: (path: string) => Promise<void>;
+    syncAccountFromDb: () => Promise<void>;
 }
 
 export const useAccountStore = create<AccountState>((set, get) => ({
@@ -68,7 +72,25 @@ export const useAccountStore = create<AccountState>((set, get) => ({
         set({ loading: true, error: null });
         try {
             await accountService.deleteAccount(accountId);
-            await get().fetchAccounts();
+            await Promise.all([
+                get().fetchAccounts(),
+                get().fetchCurrentAccount()
+            ]);
+            set({ loading: false });
+        } catch (error) {
+            set({ error: String(error), loading: false });
+            throw error;
+        }
+    },
+
+    deleteAccounts: async (accountIds: string[]) => {
+        set({ loading: true, error: null });
+        try {
+            await accountService.deleteAccounts(accountIds);
+            await Promise.all([
+                get().fetchAccounts(),
+                get().fetchCurrentAccount()
+            ]);
             set({ loading: false });
         } catch (error) {
             set({ error: String(error), loading: false });
@@ -125,6 +147,18 @@ export const useAccountStore = create<AccountState>((set, get) => ({
         }
     },
 
+    completeOAuthLogin: async () => {
+        set({ loading: true, error: null });
+        try {
+            await accountService.completeOAuthLogin();
+            await get().fetchAccounts();
+            set({ loading: false });
+        } catch (error) {
+            set({ error: String(error), loading: false });
+            throw error;
+        }
+    },
+
     cancelOAuthLogin: async () => {
         try {
             await accountService.cancelOAuthLogin();
@@ -150,11 +184,42 @@ export const useAccountStore = create<AccountState>((set, get) => ({
         set({ loading: true, error: null });
         try {
             await accountService.importFromDb();
-            await get().fetchAccounts();
+            await Promise.all([
+                get().fetchAccounts(),
+                get().fetchCurrentAccount()
+            ]);
             set({ loading: false });
         } catch (error) {
             set({ error: String(error), loading: false });
             throw error;
+        }
+    },
+
+    importFromCustomDb: async (path: string) => {
+        set({ loading: true, error: null });
+        try {
+            await accountService.importFromCustomDb(path);
+            await Promise.all([
+                get().fetchAccounts(),
+                get().fetchCurrentAccount()
+            ]);
+            set({ loading: false });
+        } catch (error) {
+            set({ error: String(error), loading: false });
+            throw error;
+        }
+    },
+
+    syncAccountFromDb: async () => {
+        try {
+            const syncedAccount = await accountService.syncAccountFromDb();
+            if (syncedAccount) {
+                console.log('[AccountStore] Account synced from DB:', syncedAccount.email);
+                await get().fetchAccounts();
+                set({ currentAccount: syncedAccount });
+            }
+        } catch (error) {
+            console.error('[AccountStore] Sync from DB failed:', error);
         }
     },
 }));
